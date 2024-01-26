@@ -21,6 +21,7 @@ use rustacuda::stream::{Stream, StreamFlags};
 use crate::device::{DeviceUuid, PciId, Vendor};
 use crate::error::{GPUError, GPUResult};
 use crate::LocalBuffer;
+use ark_std::{end_timer, start_timer};
 
 /// A Buffer to be used for sending and receiving data to/from the GPU.
 #[derive(Debug)]
@@ -120,6 +121,7 @@ pub struct Program {
     context: rustacuda::context::UnownedContext,
     module: rustacuda::module::Module,
     stream: Stream,
+    stream_buffer: Stream,
     device_name: String,
 }
 
@@ -140,9 +142,14 @@ impl Program {
             Self::pop_context();
             err
         })?;
+        let stream_buffer = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
+            Self::pop_context();
+            err
+        })?;
         let prog = Program {
             module,
             stream,
+            stream_buffer,
             device_name: device.name(),
             context: device.context.clone(),
         };
@@ -161,9 +168,14 @@ impl Program {
             Self::pop_context();
             err
         })?;
+        let stream_buffer = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
+            Self::pop_context();
+            err
+        })?;
         let prog = Program {
             module,
             stream,
+            stream_buffer,
             device_name: device.name(),
             context: device.context.clone(),
         };
@@ -255,6 +267,32 @@ impl Program {
 
         Ok(())
     }
+
+
+    pub fn write_from_buffer_stream_async<T>(&self, buffer: &mut Buffer<T>, data: &[T]) -> GPUResult<()> {
+        assert!(data.len() <= buffer.length, "Buffer is too small");
+
+        // Transmuting types is safe as long a sizes match.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+
+        // It is safe as we synchronize the stream after the call.
+        unsafe { buffer.buffer.async_copy_from(bytes, &self.stream_buffer)? };
+        // self.stream_buffer.synchronize()?;
+
+        Ok(())
+    }
+
+    pub fn buffer_stream_wait(&self) -> GPUResult<()> {
+        self.stream_buffer.synchronize()?;
+
+        Ok(())
+    }
+
 
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
