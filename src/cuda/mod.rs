@@ -15,13 +15,14 @@ use std::ffi::{c_void, CStr, CString};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer};
+use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer, DevicePointer, DeviceSlice};
 use rustacuda::stream::{Stream, StreamFlags};
 
 use crate::device::{DeviceUuid, PciId, Vendor};
 use crate::error::{GPUError, GPUResult};
 use crate::LocalBuffer;
-use ark_std::{end_timer, start_timer};
+// use ark_std::{end_timer, start_timer};
+use std::rc::Rc;
 
 /// A Buffer to be used for sending and receiving data to/from the GPU.
 #[derive(Debug)]
@@ -31,6 +32,60 @@ pub struct Buffer<T> {
     length: usize,
     _phantom: std::marker::PhantomData<T>,
 }
+
+impl<T> Buffer<T> {
+    pub fn null(&mut self)  {
+        self.buffer = unsafe {DeviceBuffer::from_raw_parts(DevicePointer::null(),0)};
+        self.length = 0;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferPoint<T> {
+    point: usize,
+    length: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> From<Rc<Buffer<T>>> for BufferPoint<T> {
+    fn from(b: Rc<Buffer<T>>) -> Self {
+        BufferPoint{
+            point: b.buffer.as_ptr() as usize,
+            length: b.length,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> From<BufferPoint<T>> for Buffer<T> {
+    fn from(b: BufferPoint<T>) -> Self {
+        let device_point = unsafe {DevicePointer::<u8>::wrap(b.point as *mut u8)};
+
+        Buffer{
+            buffer: unsafe{DeviceBuffer::from_raw_parts(device_point,b.length * std::mem::size_of::<T>())},
+            length: b.length,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferSlice<'a,T> {
+    buffer: &'a mut DeviceSlice<u8>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> From<BufferPoint<T>> for BufferSlice<'_,T> {
+    fn from(buffer: BufferPoint<T>)->Self{
+        let device_point = unsafe {DevicePointer::<u8>::wrap(buffer.point as *mut u8)};
+
+        BufferSlice {
+            buffer: unsafe{DeviceSlice::from_raw_parts_mut(device_point,buffer.length * std::mem::size_of::<T>())},
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
 
 /// CUDA specific device.
 #[allow(dead_code)]
@@ -121,7 +176,7 @@ pub struct Program {
     context: rustacuda::context::UnownedContext,
     module: rustacuda::module::Module,
     stream: Stream,
-    stream_buffer: Stream,
+    stream_2: Stream,
     device_name: String,
 }
 
@@ -142,14 +197,14 @@ impl Program {
             Self::pop_context();
             err
         })?;
-        let stream_buffer = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
+        let stream_2 = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
             Self::pop_context();
             err
         })?;
         let prog = Program {
             module,
             stream,
-            stream_buffer,
+            stream_2,
             device_name: device.name(),
             context: device.context.clone(),
         };
@@ -168,14 +223,14 @@ impl Program {
             Self::pop_context();
             err
         })?;
-        let stream_buffer = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
+        let stream_2 = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|err| {
             Self::pop_context();
             err
         })?;
         let prog = Program {
             module,
             stream,
-            stream_buffer,
+            stream_2,
             device_name: device.name(),
             context: device.context.clone(),
         };
@@ -268,6 +323,25 @@ impl Program {
         Ok(())
     }
 
+    /// Puts data from an existing buffer onto the GPU.
+    pub fn write_from_buffer_slice<T>(&self, buffer: &mut BufferSlice<T>, data: &[T]) -> GPUResult<()> {
+        assert!(data.len() <= buffer.buffer.len(), "Buffer is too small");
+
+        // Transmuting types is safe as long a sizes match.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+
+        // It is safe as we synchronize the stream after the call.
+        unsafe { buffer.buffer.async_copy_from(bytes, &self.stream)? };
+        self.stream.synchronize()?;
+
+        Ok(())
+    }
+
 
     pub fn write_from_buffer_stream_async<T>(&self, buffer: &mut Buffer<T>, data: &[T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");
@@ -281,14 +355,14 @@ impl Program {
         };
 
         // It is safe as we synchronize the stream after the call.
-        unsafe { buffer.buffer.async_copy_from(bytes, &self.stream_buffer)? };
-        // self.stream_buffer.synchronize()?;
+        unsafe { buffer.buffer.async_copy_from(bytes, &self.stream_2)? };
+        // self.stream_2.synchronize()?;
 
         Ok(())
     }
 
-    pub fn buffer_stream_wait(&self) -> GPUResult<()> {
-        self.stream_buffer.synchronize()?;
+    pub fn stream_2_wait(&self) -> GPUResult<()> {
+        self.stream_2.synchronize()?;
 
         Ok(())
     }
@@ -473,6 +547,7 @@ impl<'a> Kernel<'a> {
         // It is safe to launch the kernel as the arguments need to live when the kernel is called,
         // and the buffers are copied synchronuously. At the end of the execution, the underlying
         // stream is synchronized.
+        // let timer = start_timer!(||"kernal.run.lunch");
         unsafe {
             self.stream.launch(
                 &self.function,
@@ -482,9 +557,13 @@ impl<'a> Kernel<'a> {
                 &args,
             )?;
         };
+        // end_timer!(timer);
         // Synchronize after the kernel execution, so that the underlying pointers can be
         // invalidated/dropped.
+        // let timer = start_timer!(||"kernal.run.sync");
         self.stream.synchronize()?;
+        // end_timer!(timer);
         Ok(())
     }
 }
+
