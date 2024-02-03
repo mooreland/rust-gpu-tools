@@ -15,13 +15,17 @@ use std::ffi::{c_void, CStr, CString};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer, DevicePointer, DeviceSlice};
+use rustacuda::memory::{
+    AsyncCopyDestination, DeviceBuffer, DevicePointer, DeviceSlice, LockedBuffer,
+};
 use rustacuda::stream::{Stream, StreamFlags};
 
 use crate::device::{DeviceUuid, PciId, Vendor};
 use crate::error::{GPUError, GPUResult};
 use crate::LocalBuffer;
-// use ark_std::{end_timer, start_timer};
+use ark_std::{end_timer, start_timer};
+use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 /// A Buffer to be used for sending and receiving data to/from the GPU.
@@ -34,8 +38,8 @@ pub struct Buffer<T> {
 }
 
 impl<T> Buffer<T> {
-    pub fn null(&mut self)  {
-        self.buffer = unsafe {DeviceBuffer::from_raw_parts(DevicePointer::null(),0)};
+    pub fn null(&mut self) {
+        self.buffer = unsafe { DeviceBuffer::from_raw_parts(DevicePointer::null(), 0) };
         self.length = 0;
     }
 }
@@ -49,7 +53,7 @@ pub struct BufferPoint<T> {
 
 impl<T> From<Rc<Buffer<T>>> for BufferPoint<T> {
     fn from(b: Rc<Buffer<T>>) -> Self {
-        BufferPoint{
+        BufferPoint {
             point: b.buffer.as_ptr() as usize,
             length: b.length,
             _phantom: std::marker::PhantomData,
@@ -59,10 +63,12 @@ impl<T> From<Rc<Buffer<T>>> for BufferPoint<T> {
 
 impl<T> From<BufferPoint<T>> for Buffer<T> {
     fn from(b: BufferPoint<T>) -> Self {
-        let device_point = unsafe {DevicePointer::<u8>::wrap(b.point as *mut u8)};
+        let device_point = unsafe { DevicePointer::<u8>::wrap(b.point as *mut u8) };
 
-        Buffer{
-            buffer: unsafe{DeviceBuffer::from_raw_parts(device_point,b.length * std::mem::size_of::<T>())},
+        Buffer {
+            buffer: unsafe {
+                DeviceBuffer::from_raw_parts(device_point, b.length * std::mem::size_of::<T>())
+            },
             length: b.length,
             _phantom: std::marker::PhantomData,
         }
@@ -70,22 +76,55 @@ impl<T> From<BufferPoint<T>> for Buffer<T> {
 }
 
 #[derive(Debug)]
-pub struct BufferSlice<'a,T> {
+pub struct BufferSlice<'a, T> {
     buffer: &'a mut DeviceSlice<u8>,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> From<BufferPoint<T>> for BufferSlice<'_,T> {
-    fn from(buffer: BufferPoint<T>)->Self{
-        let device_point = unsafe {DevicePointer::<u8>::wrap(buffer.point as *mut u8)};
+impl<T> From<BufferPoint<T>> for BufferSlice<'_, T> {
+    fn from(buffer: BufferPoint<T>) -> Self {
+        let device_point = unsafe { DevicePointer::<u8>::wrap(buffer.point as *mut u8) };
 
         BufferSlice {
-            buffer: unsafe{DeviceSlice::from_raw_parts_mut(device_point,buffer.length * std::mem::size_of::<T>())},
+            buffer: unsafe {
+                DeviceSlice::from_raw_parts_mut(
+                    device_point,
+                    buffer.length * std::mem::size_of::<T>(),
+                )
+            },
             _phantom: std::marker::PhantomData,
         }
     }
 }
 
+#[derive(Debug)]
+pub struct HostBuffer<T> {
+    buffer: LockedBuffer<u8>,
+    /// The number of T-sized elements.
+    length: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<F> Deref for HostBuffer<F> {
+    type Target = [F];
+
+    fn deref(&self) -> &[F] {
+        unsafe {
+            std::slice::from_raw_parts(self.buffer.as_slice().as_ptr() as *const F, self.length)
+        }
+    }
+}
+
+impl<F> DerefMut for HostBuffer<F> {
+    fn deref_mut(&mut self) -> &mut [F] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.as_mut_slice().as_mut_ptr() as *mut F,
+                self.length,
+            )
+        }
+    }
+}
 
 /// CUDA specific device.
 #[allow(dead_code)]
@@ -285,6 +324,23 @@ impl Program {
         })
     }
 
+    pub fn set_context(device: &Device) -> GPUResult<()> {
+        rustacuda::context::CurrentContext::set_current(&device.context)?;
+        Ok(())
+    }
+
+    pub unsafe fn create_host_buffer<T>(length: usize) -> GPUResult<HostBuffer<T>> {
+        assert!(length > 0);
+        // This is the unsafe call, the rest of the function is safe code.
+        let buffer = LockedBuffer::<u8>::uninitialized(length * std::mem::size_of::<T>())?;
+
+        Ok(HostBuffer::<T> {
+            buffer,
+            length,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
     /// Returns a kernel.
     ///
     /// The `global_work_size` does *not* follow the OpenCL definition. It is *not* the total
@@ -324,7 +380,11 @@ impl Program {
     }
 
     /// Puts data from an existing buffer onto the GPU.
-    pub fn write_from_buffer_slice<T>(&self, buffer: &mut BufferSlice<T>, data: &[T]) -> GPUResult<()> {
+    pub fn write_from_buffer_slice<T>(
+        &self,
+        buffer: &mut BufferSlice<T>,
+        data: &[T],
+    ) -> GPUResult<()> {
         assert!(data.len() <= buffer.buffer.len(), "Buffer is too small");
 
         // Transmuting types is safe as long a sizes match.
@@ -342,11 +402,37 @@ impl Program {
         Ok(())
     }
 
+    pub fn register_slice<T>(slice: &[T]) -> GPUResult<()> {
+        let size = mem::size_of::<T>() * slice.len();
 
-    pub fn write_from_buffer_stream_async<T>(&self, buffer: &mut Buffer<T>, data: &[T]) -> GPUResult<()> {
+        let timer = start_timer!(|| "register memory pin");
+        let _ = unsafe {
+            cuda_driver_sys::cuMemHostRegister_v2(
+                slice.as_ptr() as *mut c_void,
+                size,
+                cuda_driver_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED as u32,
+            )
+        };
+        end_timer!(timer);
+
+        Ok(())
+    }
+    pub fn unregister_slice<T>(slice: &[T]) -> GPUResult<()> {
+        // unsafe {DeviceBuffer::<T>::unregister_slice(slice).unwrap()};
+        let timer = start_timer!(|| "UN-register memory pin");
+        let _ = unsafe { cuda_driver_sys::cuMemHostUnregister(slice.as_ptr() as *mut c_void) };
+        end_timer!(timer);
+        Ok(())
+    }
+
+    pub fn write_from_buffer_stream_async<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+    ) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");
-
         // Transmuting types is safe as long a sizes match.
+        let timer = start_timer!(|| "write_buffer_async");
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 data.as_ptr() as *const T as *const u8,
@@ -356,17 +442,15 @@ impl Program {
 
         // It is safe as we synchronize the stream after the call.
         unsafe { buffer.buffer.async_copy_from(bytes, &self.stream_2)? };
-        // self.stream_2.synchronize()?;
+        end_timer!(timer);
 
         Ok(())
     }
 
     pub fn stream_2_wait(&self) -> GPUResult<()> {
         self.stream_2.synchronize()?;
-
         Ok(())
     }
-
 
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
@@ -407,7 +491,7 @@ impl Program {
     /// Pop the current context.
     ///
     /// It panics as it's an unrecoverable error.
-    fn pop_context() {
+    pub fn pop_context() {
         rustacuda::context::ContextStack::pop().expect("Cannot remove context.");
     }
 }
@@ -566,4 +650,3 @@ impl<'a> Kernel<'a> {
         Ok(())
     }
 }
-
