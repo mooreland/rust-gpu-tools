@@ -324,15 +324,17 @@ impl Program {
         })
     }
 
-    pub fn set_context(device: &Device) -> GPUResult<()> {
-        rustacuda::context::CurrentContext::set_current(&device.context)?;
-        Ok(())
-    }
 
-    pub unsafe fn create_host_buffer<T>(length: usize) -> GPUResult<HostBuffer<T>> {
+
+    pub unsafe fn create_host_buffer<T>(device: &Device,length: usize) -> GPUResult<HostBuffer<T>> {
         assert!(length > 0);
         // This is the unsafe call, the rest of the function is safe code.
-        let buffer = LockedBuffer::<u8>::uninitialized(length * std::mem::size_of::<T>())?;
+        rustacuda::context::CurrentContext::set_current(&device.context)?;
+        let buffer = LockedBuffer::<u8>::uninitialized(length * std::mem::size_of::<T>()).map_err(|err|{
+           Self::pop_context();
+           err
+        })?;
+        Self::pop_context();
 
         Ok(HostBuffer::<T> {
             buffer,
@@ -402,28 +404,6 @@ impl Program {
         Ok(())
     }
 
-    pub fn register_slice<T>(slice: &[T]) -> GPUResult<()> {
-        let size = mem::size_of::<T>() * slice.len();
-
-        let timer = start_timer!(|| "register memory pin");
-        let _ = unsafe {
-            cuda_driver_sys::cuMemHostRegister_v2(
-                slice.as_ptr() as *mut c_void,
-                size,
-                cuda_driver_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED as u32,
-            )
-        };
-        end_timer!(timer);
-
-        Ok(())
-    }
-    pub fn unregister_slice<T>(slice: &[T]) -> GPUResult<()> {
-        // unsafe {DeviceBuffer::<T>::unregister_slice(slice).unwrap()};
-        let timer = start_timer!(|| "UN-register memory pin");
-        let _ = unsafe { cuda_driver_sys::cuMemHostUnregister(slice.as_ptr() as *mut c_void) };
-        end_timer!(timer);
-        Ok(())
-    }
 
     pub fn write_from_buffer_stream_async<T>(
         &self,
@@ -494,6 +474,36 @@ impl Program {
     pub fn pop_context() {
         rustacuda::context::ContextStack::pop().expect("Cannot remove context.");
     }
+
+
+    pub fn register_host_buffer<T>(device: &Device,slice: &[T]) -> GPUResult<()> {
+        rustacuda::context::CurrentContext::set_current(&device.context)?;
+        let size = mem::size_of::<T>() * slice.len();
+
+        let timer = start_timer!(|| "register memory pin");
+        //TODO process return error or add this api to fil-rustcuda
+        let _ = unsafe {
+            cuda_driver_sys::cuMemHostRegister_v2(
+                slice.as_ptr() as *mut c_void,
+                size,
+                cuda_driver_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED as u32,
+            )
+        };
+        end_timer!(timer);
+        Self::pop_context();
+        Ok(())
+    }
+
+    pub fn unregister_host_buffer<T>(device: &Device,slice: &[T]) -> GPUResult<()> {
+        rustacuda::context::CurrentContext::set_current(&device.context)?;
+        let timer = start_timer!(|| "UN-register memory pin");
+        let _ = unsafe { cuda_driver_sys::cuMemHostUnregister(slice.as_ptr() as *mut c_void) };
+        end_timer!(timer);
+        Self::pop_context();
+        Ok(())
+    }
+
+
 }
 
 // TODO vmx 2021-07-07: Check if RustaCUDA types used in `Program` can be made `Send`, so that
@@ -631,7 +641,6 @@ impl<'a> Kernel<'a> {
         // It is safe to launch the kernel as the arguments need to live when the kernel is called,
         // and the buffers are copied synchronuously. At the end of the execution, the underlying
         // stream is synchronized.
-        // let timer = start_timer!(||"kernal.run.lunch");
         unsafe {
             self.stream.launch(
                 &self.function,
@@ -641,12 +650,9 @@ impl<'a> Kernel<'a> {
                 &args,
             )?;
         };
-        // end_timer!(timer);
         // Synchronize after the kernel execution, so that the underlying pointers can be
         // invalidated/dropped.
-        // let timer = start_timer!(||"kernal.run.sync");
         self.stream.synchronize()?;
-        // end_timer!(timer);
         Ok(())
     }
 }
